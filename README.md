@@ -261,19 +261,6 @@ MCP servers are configured in `mcp.json`:
 }
 ```
 
-## 🤝 Contributing
-
-This project follows spec-driven development. To contribute:
-
-1. Review the requirements and design documents in `.kiro/specs/`
-2. Pick a task from `tasks.md`
-3. Implement according to the specification
-4. Write tests that validate correctness properties
-5. Submit a pull request
-
-## 📝 License
-
-[Add your license here]
 
 ## 🙏 Acknowledgments
 
@@ -284,10 +271,13 @@ This project follows spec-driven development. To contribute:
 
 ## 📧 Contact
 
-[Add your contact information]
+Anup Pradhan
+Chief Architect
+AImitari Medtech Pte. Ltd.  
+
 
 ---
 
 **Status**: Phase 2 Complete - Agent Orchestrator Implemented ✅
 
-Built with ❤️ using spec-driven development and property-based testing.
+
