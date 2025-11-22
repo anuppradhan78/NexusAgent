@@ -21,6 +21,7 @@ import structlog
 
 from mcp_client import MCPClient, APIEndpoint
 from memory_store import MemoryStore, MemoryEntry
+from learning_engine import LearningEngine, RefinedQuery
 
 logger = structlog.get_logger()
 
@@ -104,6 +105,7 @@ class ResearchResult:
         api_results: Raw API results
         processing_time_ms: Total processing time
         memory_id: ID of stored memory entry
+        refined_query: Query refinement information from learning engine
     """
     query_id: str
     query: str
@@ -113,6 +115,7 @@ class ResearchResult:
     api_results: List[APIResult]
     processing_time_ms: float
     memory_id: str
+    refined_query: Optional[RefinedQuery] = None
 
 
 class AgentOrchestratorError(Exception):
@@ -145,7 +148,8 @@ class AgentOrchestrator:
     def __init__(
         self,
         mcp_client: MCPClient,
-        memory_store: MemoryStore
+        memory_store: MemoryStore,
+        learning_engine: Optional[LearningEngine] = None
     ):
         """
         Initialize agent orchestrator with dependencies.
@@ -153,9 +157,11 @@ class AgentOrchestrator:
         Args:
             mcp_client: MCP client for Claude and Postman access
             memory_store: Redis memory store for learning
+            learning_engine: Optional learning engine for query refinement
         """
         self.mcp_client = mcp_client
         self.memory_store = memory_store
+        self.learning_engine = learning_engine or LearningEngine(memory_store, mcp_client)
         
         logger.info("agent_orchestrator_initialized")
     
@@ -218,9 +224,25 @@ class AgentOrchestrator:
                 count=len(similar_queries)
             )
             
+            # Step 2.5: Apply query refinements from learning engine
+            # Requirements: 2.3, 2.4, 4.1, 4.5, 4.6
+            logger.info("step_2_5_refining_query", query_id=query_id)
+            refined_query = await self.learning_engine.refine_query(
+                original_query=query,
+                similar_patterns=similar_queries
+            )
+            
+            logger.info(
+                "query_refined",
+                query_id=query_id,
+                refinements_count=len(refined_query.refinements),
+                confidence=refined_query.confidence,
+                prioritized_sources_count=len(refined_query.prioritized_sources)
+            )
+            
             # Step 3: Discover relevant APIs from Postman
             logger.info("step_3_discovering_apis", query_id=query_id)
-            api_sources = await self._discover_apis(intent, max_sources)
+            api_sources = await self._discover_apis(intent, max_sources, refined_query)
             
             if not api_sources:
                 logger.warning(
@@ -251,15 +273,27 @@ class AgentOrchestrator:
             )
             
             # Step 6: Store in memory for learning
+            # Requirements: 4.6 - Track refinement effectiveness
             logger.info("step_6_storing_memory", query_id=query_id)
+            
+            # Include refinement metadata for tracking effectiveness
+            results_with_metadata = {
+                "summary": synthesis.summary,
+                "findings": synthesis.findings,
+                "confidence": synthesis.confidence_score,
+                "refinement_applied": len(refined_query.refinements) > 0,
+                "refinement_confidence": refined_query.confidence,
+                "refinements": refined_query.refinements,
+                "prioritized_sources_used": [
+                    api.api_id for api in api_sources 
+                    if api.api_id in refined_query.prioritized_sources
+                ]
+            }
+            
             memory_id = await self.memory_store.store(
                 query=query,
                 query_embedding=query_embedding,
-                results={
-                    "summary": synthesis.summary,
-                    "findings": synthesis.findings,
-                    "confidence": synthesis.confidence_score
-                },
+                results=results_with_metadata,
                 sources=[api.api_id for api in api_sources],
                 relevance_score=0.5,  # Initial score, updated by feedback
                 session_id=session_id
@@ -277,7 +311,8 @@ class AgentOrchestrator:
                 similar_queries=similar_queries,
                 api_results=api_results,
                 processing_time_ms=processing_time_ms,
-                memory_id=memory_id
+                memory_id=memory_id,
+                refined_query=refined_query
             )
             
             logger.info(
@@ -285,7 +320,9 @@ class AgentOrchestrator:
                 query_id=query_id,
                 processing_time_ms=processing_time_ms,
                 api_sources_used=len(api_sources),
-                confidence_score=synthesis.confidence_score
+                confidence_score=synthesis.confidence_score,
+                refinement_applied=len(refined_query.refinements) > 0,
+                refinement_confidence=refined_query.confidence
             )
             
             return result
@@ -437,21 +474,27 @@ Respond ONLY with valid JSON, no additional text."""
     async def _discover_apis(
         self,
         intent: QueryIntent,
-        max_sources: int = 5
+        max_sources: int = 5,
+        refined_query: Optional[RefinedQuery] = None
     ) -> List[APIEndpoint]:
         """
         Discover relevant APIs from Postman based on query intent.
         
+        Prioritizes API sources based on learned performance from past queries.
+        
         Requirements:
         - 9.2: Query Postman Public API Network to discover relevant APIs
         - 1.1: Identify relevant API sources from Postman Public API Network
+        - 2.4: Prioritize API sources based on historical patterns
+        - 4.5: Track refinement effectiveness
         
         Args:
             intent: Parsed query intent
             max_sources: Maximum number of APIs to return
+            refined_query: Optional refined query with prioritized sources
             
         Returns:
-            List[APIEndpoint]: Discovered API endpoints
+            List[APIEndpoint]: Discovered API endpoints, prioritized by learning
         """
         try:
             discovered_apis = []
@@ -487,6 +530,29 @@ Respond ONLY with valid JSON, no additional text."""
                 if api.api_id not in unique_apis:
                     unique_apis[api.api_id] = api
             
+            # Apply learned prioritization if available
+            # Requirements: 2.4, 4.5 - Prioritize based on learned performance
+            if refined_query and refined_query.prioritized_sources:
+                logger.info(
+                    "applying_learned_prioritization",
+                    prioritized_sources=refined_query.prioritized_sources
+                )
+                
+                # Boost priority scores for learned high-performing sources
+                for api in unique_apis.values():
+                    if api.api_id in refined_query.prioritized_sources:
+                        # Boost priority by position in prioritized list
+                        boost_index = refined_query.prioritized_sources.index(api.api_id)
+                        boost_factor = 1.0 + (0.5 * (1.0 - boost_index / len(refined_query.prioritized_sources)))
+                        api.priority_score *= boost_factor
+                        
+                        logger.debug(
+                            "api_priority_boosted",
+                            api_id=api.api_id,
+                            boost_factor=boost_factor,
+                            new_priority=api.priority_score
+                        )
+            
             # Sort by priority score and limit to max_sources
             sorted_apis = sorted(
                 unique_apis.values(),
@@ -498,7 +564,8 @@ Respond ONLY with valid JSON, no additional text."""
                 "api_discovery_complete",
                 total_discovered=len(discovered_apis),
                 unique_apis=len(unique_apis),
-                final_count=len(sorted_apis)
+                final_count=len(sorted_apis),
+                learning_applied=refined_query is not None and len(refined_query.prioritized_sources) > 0
             )
             
             return sorted_apis

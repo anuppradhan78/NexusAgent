@@ -60,6 +60,10 @@ class MCPClient:
         self.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
         self.postman_api_key = os.getenv("POSTMAN_API_KEY")
         
+        # Store context managers to keep streams alive
+        self.claude_context = None
+        self.postman_context = None
+        
         # Retry configuration
         self.max_retries = 3
         self.base_delay = 1.0  # seconds
@@ -185,14 +189,16 @@ class MCPClient:
             env={"ANTHROPIC_API_KEY": self.anthropic_api_key}
         )
         
-        # Use stdio_client as async context manager properly
-        async with stdio_client(server_params) as (read_stream, write_stream):
-            # Create and initialize session
-            session = ClientSession(read_stream, write_stream)
-            await session.initialize()
-            
-            # Store session (streams will remain open)
-            return session
+        # Create and enter the context manager
+        # We store it to keep the stdio streams alive for the session's lifetime
+        self.claude_context = stdio_client(server_params)
+        read_stream, write_stream = await self.claude_context.__aenter__()
+        
+        # Create and initialize session with the streams
+        session = ClientSession(read_stream, write_stream)
+        await session.initialize()
+        
+        return session
     
     async def _connect_postman(self) -> ClientSession:
         """
@@ -209,14 +215,16 @@ class MCPClient:
             env={"POSTMAN_API_KEY": self.postman_api_key}
         )
         
-        # Use stdio_client as async context manager properly
-        async with stdio_client(server_params) as (read_stream, write_stream):
-            # Create and initialize session
-            session = ClientSession(read_stream, write_stream)
-            await session.initialize()
-            
-            # Store session (streams will remain open)
-            return session
+        # Create and enter the context manager
+        # We store it to keep the stdio streams alive for the session's lifetime
+        self.postman_context = stdio_client(server_params)
+        read_stream, write_stream = await self.postman_context.__aenter__()
+        
+        # Create and initialize session with the streams
+        session = ClientSession(read_stream, write_stream)
+        await session.initialize()
+        
+        return session
 
     async def call_claude(
         self,
@@ -510,13 +518,33 @@ class MCPClient:
     async def close(self) -> None:
         """
         Close MCP connections gracefully.
+        
+        This properly exits the context managers, which terminates the
+        MCP server subprocesses and closes the stdio streams.
         """
         logger.info("closing_mcp_connections")
         
-        # Note: Sessions are managed by the stdio_client context manager
-        # Just clear references
-        self.claude_session = None
-        self.postman_session = None
+        # Exit Claude context manager if it exists
+        if self.claude_context:
+            try:
+                await self.claude_context.__aexit__(None, None, None)
+                logger.info("claude_context_closed")
+            except Exception as e:
+                logger.warning("claude_context_close_error", error=str(e))
+            finally:
+                self.claude_context = None
+                self.claude_session = None
+        
+        # Exit Postman context manager if it exists
+        if self.postman_context:
+            try:
+                await self.postman_context.__aexit__(None, None, None)
+                logger.info("postman_context_closed")
+            except Exception as e:
+                logger.warning("postman_context_close_error", error=str(e))
+            finally:
+                self.postman_context = None
+                self.postman_session = None
         
         logger.info("mcp_connections_closed")
     
