@@ -37,6 +37,9 @@ env/
 *.swo
 *~
 
+# Kiro specs (project-specific)
+.kiro/specs/
+
 # Reports (exclude generated reports but keep documentation)
 reports/*.md
 !README.md
