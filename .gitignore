@@ -40,6 +40,9 @@ env/
 # Kiro specs (project-specific)
 .kiro/specs/
 
+# Example projects
+example projects/
+
 # Reports (exclude generated reports but keep documentation)
 reports/*.md
 !README.md
