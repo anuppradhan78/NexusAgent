@@ -1,0 +1,24 @@
+# Core Framework
+fastapi==0.110.0
+uvicorn[standard]==0.27.0
+pydantic==2.6.0
+python-dotenv==1.0.1
+
+# AI & MCP
+anthropic==0.18.1
+mcp==1.22.0
+
+# Memory & Storage
+redis[hiredis]==5.0.1
+numpy>=1.26.0
+
+# Observability
+structlog==24.1.0
+APScheduler==3.10.4
+
+# HTTP Client
+httpx==0.26.0
+
+# Testing
+pytest==8.0.0
+pytest-asyncio==0.23.4
