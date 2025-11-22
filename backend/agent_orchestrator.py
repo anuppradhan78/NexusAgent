@@ -22,6 +22,8 @@ import structlog
 from mcp_client import MCPClient, APIEndpoint
 from memory_store import MemoryStore, MemoryEntry
 from learning_engine import LearningEngine, RefinedQuery
+from alert_engine import AlertEngine, Alert
+from report_generator import ReportGenerator, ReportPath
 
 logger = structlog.get_logger()
 
@@ -106,6 +108,8 @@ class ResearchResult:
         processing_time_ms: Total processing time
         memory_id: ID of stored memory entry
         refined_query: Query refinement information from learning engine
+        alert: Alert object if alert was triggered
+        report_path: Path to generated report if requested
     """
     query_id: str
     query: str
@@ -116,6 +120,8 @@ class ResearchResult:
     processing_time_ms: float
     memory_id: str
     refined_query: Optional[RefinedQuery] = None
+    alert: Optional[Alert] = None
+    report_path: Optional[ReportPath] = None
 
 
 class AgentOrchestratorError(Exception):
@@ -149,7 +155,9 @@ class AgentOrchestrator:
         self,
         mcp_client: MCPClient,
         memory_store: MemoryStore,
-        learning_engine: Optional[LearningEngine] = None
+        learning_engine: Optional[LearningEngine] = None,
+        alert_engine: Optional[AlertEngine] = None,
+        report_generator: Optional[ReportGenerator] = None
     ):
         """
         Initialize agent orchestrator with dependencies.
@@ -158,10 +166,14 @@ class AgentOrchestrator:
             mcp_client: MCP client for Claude and Postman access
             memory_store: Redis memory store for learning
             learning_engine: Optional learning engine for query refinement
+            alert_engine: Optional alert engine for notifications
+            report_generator: Optional report generator for creating reports
         """
         self.mcp_client = mcp_client
         self.memory_store = memory_store
         self.learning_engine = learning_engine or LearningEngine(memory_store, mcp_client)
+        self.alert_engine = alert_engine or AlertEngine(mcp_client)
+        self.report_generator = report_generator or ReportGenerator()
         
         logger.info("agent_orchestrator_initialized")
     
@@ -170,7 +182,9 @@ class AgentOrchestrator:
         query: str,
         session_id: Optional[str] = None,
         max_sources: int = 5,
-        timeout: int = 30
+        timeout: int = 30,
+        include_report: bool = True,
+        alert_enabled: bool = True
     ) -> ResearchResult:
         """
         Main agent processing pipeline.
@@ -180,15 +194,19 @@ class AgentOrchestrator:
         - 1.2: Query multiple API endpoints in parallel
         - 1.3: Use Claude to synthesize information
         - 1.4: Include source citations with confidence scores
+        - 5.1: Analyze gathered information for urgency and send alerts
+        - 6.1: Generate comprehensive research reports
         
         Args:
             query: Natural language research query
             session_id: Optional session ID for multi-turn conversations
             max_sources: Maximum number of API sources to use
             timeout: Timeout in seconds for the entire operation
+            include_report: Whether to generate a report (default: True)
+            alert_enabled: Whether to evaluate for alerts (default: True)
             
         Returns:
-            ResearchResult: Complete research results
+            ResearchResult: Complete research results including alert and report
             
         Raises:
             AgentOrchestratorError: If processing fails critically
@@ -272,6 +290,60 @@ class AgentOrchestrator:
                 similar_queries=similar_queries
             )
             
+            # Step 5.5: Evaluate for alerts
+            # Requirements: 5.1 - Analyze gathered information for urgency
+            alert = None
+            if alert_enabled:
+                logger.info("step_5_5_evaluating_alert", query_id=query_id)
+                alert = await self.alert_engine.evaluate(
+                    query=query,
+                    synthesis=synthesis
+                )
+                
+                if alert:
+                    logger.info(
+                        "alert_triggered",
+                        query_id=query_id,
+                        severity=alert.severity
+                    )
+            
+            # Step 5.6: Generate report
+            # Requirements: 6.1 - Generate Research_Report documents
+            report_path = None
+            if include_report:
+                logger.info("step_5_6_generating_report", query_id=query_id)
+                try:
+                    report_path = await self.report_generator.generate(
+                        query=query,
+                        query_id=query_id,
+                        intent=intent,
+                        synthesis=synthesis,
+                        api_results=api_results,
+                        similar_queries=similar_queries,
+                        metadata={
+                            "processing_time_ms": (time.time() - start_time) * 1000,
+                            "api_sources": [api.api_id for api in api_sources],
+                            "refinements": refined_query.refinements,
+                            "refinement_applied": len(refined_query.refinements) > 0,
+                            "refinement_confidence": refined_query.confidence,
+                            "session_id": session_id,
+                            "alert_triggered": alert is not None
+                        }
+                    )
+                    
+                    logger.info(
+                        "report_generated",
+                        query_id=query_id,
+                        report_path=report_path.full_path if report_path else None
+                    )
+                except Exception as e:
+                    logger.error(
+                        "report_generation_failed",
+                        query_id=query_id,
+                        error=str(e)
+                    )
+                    # Continue without report - not critical
+            
             # Step 6: Store in memory for learning
             # Requirements: 4.6 - Track refinement effectiveness
             logger.info("step_6_storing_memory", query_id=query_id)
@@ -312,7 +384,9 @@ class AgentOrchestrator:
                 api_results=api_results,
                 processing_time_ms=processing_time_ms,
                 memory_id=memory_id,
-                refined_query=refined_query
+                refined_query=refined_query,
+                alert=alert,
+                report_path=report_path
             )
             
             logger.info(
@@ -322,7 +396,9 @@ class AgentOrchestrator:
                 api_sources_used=len(api_sources),
                 confidence_score=synthesis.confidence_score,
                 refinement_applied=len(refined_query.refinements) > 0,
-                refinement_confidence=refined_query.confidence
+                refinement_confidence=refined_query.confidence,
+                alert_triggered=alert is not None,
+                report_generated=report_path is not None
             )
             
             return result

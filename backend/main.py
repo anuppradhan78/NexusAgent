@@ -5,6 +5,7 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
+from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,6 +25,8 @@ from models import (
 from agent_orchestrator import AgentOrchestrator, AgentOrchestratorError
 from mcp_client import MCPClient, MCPConnectionError
 from memory_store import MemoryStore, MemoryStoreError
+from alert_engine import AlertEngine
+from report_generator import ReportGenerator
 
 # Load environment variables
 load_dotenv()
@@ -88,6 +91,8 @@ class Config:
 # Global instances (initialized during startup)
 mcp_client: Optional[MCPClient] = None
 memory_store: Optional[MemoryStore] = None
+alert_engine: Optional[AlertEngine] = None
+report_generator: Optional[ReportGenerator] = None
 agent_orchestrator: Optional[AgentOrchestrator] = None
 
 
@@ -95,7 +100,7 @@ agent_orchestrator: Optional[AgentOrchestrator] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Handle application startup and shutdown"""
-    global mcp_client, memory_store, agent_orchestrator
+    global mcp_client, memory_store, alert_engine, report_generator, agent_orchestrator
     
     # Startup
     logger.info(
@@ -134,11 +139,23 @@ async def lifespan(app: FastAPI):
         )
         logger.info("memory_store_initialized")
         
+        # Initialize alert engine
+        logger.info("initializing_alert_engine")
+        alert_engine = AlertEngine(mcp_client=mcp_client)
+        logger.info("alert_engine_initialized")
+        
+        # Initialize report generator
+        logger.info("initializing_report_generator")
+        report_generator = ReportGenerator(output_dir=Config.REPORT_OUTPUT_DIR)
+        logger.info("report_generator_initialized")
+        
         # Initialize agent orchestrator
         logger.info("initializing_agent_orchestrator")
         agent_orchestrator = AgentOrchestrator(
             mcp_client=mcp_client,
-            memory_store=memory_store
+            memory_store=memory_store,
+            alert_engine=alert_engine,
+            report_generator=report_generator
         )
         logger.info("agent_orchestrator_initialized")
         
@@ -268,11 +285,14 @@ async def research_query(request: ResearchRequest):
     
     try:
         # Process query through agent orchestrator
+        # Requirements: 5.1, 6.1, 12.1 - Include alerts and reports
         result = await agent_orchestrator.process_query(
             query=request.query,
             session_id=request.session_id,
             max_sources=request.max_sources,
-            timeout=30
+            timeout=30,
+            include_report=request.include_report,
+            alert_enabled=request.alert_enabled
         )
         
         # Convert APIEndpoint objects to APISource models
@@ -310,6 +330,7 @@ async def research_query(request: ResearchRequest):
             ))
         
         # Build response
+        # Requirements: 12.1 - Include alert status and report path in API response
         response = ResearchResponse(
             query_id=result.query_id,
             session_id=request.session_id or result.query_id,
@@ -318,8 +339,8 @@ async def research_query(request: ResearchRequest):
             findings=result.synthesis.findings,
             sources=api_sources,
             confidence_score=result.synthesis.confidence_score,
-            alert_triggered=False,  # TODO: Implement alert engine in Phase 4
-            report_path=None,  # TODO: Implement report generator in Phase 4
+            alert_triggered=result.alert is not None,
+            report_path=result.report_path.full_path if result.report_path else None,
             processing_time_ms=result.processing_time_ms,
             similar_past_queries=memory_entries,
             memory_id=result.memory_id,
@@ -333,7 +354,9 @@ async def research_query(request: ResearchRequest):
             query_id=result.query_id,
             processing_time_ms=result.processing_time_ms,
             confidence_score=result.synthesis.confidence_score,
-            sources_count=len(api_sources)
+            sources_count=len(api_sources),
+            alert_triggered=result.alert is not None,
+            report_generated=result.report_path is not None
         )
         
         return response
@@ -525,6 +548,531 @@ async def submit_feedback(feedback: models.FeedbackRequest):
         raise HTTPException(
             status_code=500,
             detail="An unexpected error occurred while processing feedback."
+        )
+
+
+# Metrics Endpoint
+@app.get("/api/metrics", response_model=models.MetricsResponse)
+async def get_metrics():
+    """
+    Get self-improvement metrics.
+    
+    Requirements:
+    - 12.4: GET endpoint returning self-improvement metrics
+    - 7.1: Track Self_Improvement_Metric values
+    - 7.2: Compute metrics over rolling windows
+    - 7.3: Detect improvement trends
+    - 7.4: Log metric snapshots
+    - 7.5: Expose metrics via /metrics endpoint
+    
+    Returns:
+        MetricsResponse: Self-improvement metrics including:
+        - Total queries processed
+        - Average relevance and confidence scores
+        - Improvement trend (positive = improving)
+        - Top performing API sources
+        - Current confidence threshold
+        - Memory statistics
+        - Recent query counts
+        
+    Raises:
+        HTTPException: If metrics calculation fails
+    """
+    # Check if components are initialized
+    if not memory_store:
+        logger.error("memory_store_not_initialized_for_metrics")
+        raise HTTPException(
+            status_code=503,
+            detail="Service not ready. Memory store not initialized."
+        )
+    
+    logger.info("metrics_requested")
+    
+    try:
+        import time
+        current_time = time.time()
+        
+        # Get all recent memories for analysis
+        # Requirement 7.2: Compute metrics over rolling windows
+        all_memories = await memory_store.get_recent(limit=1000, min_relevance=0.0)
+        
+        if not all_memories:
+            # No data yet, return default metrics
+            logger.info("no_memories_for_metrics", returning_defaults=True)
+            return models.MetricsResponse(
+                total_queries=0,
+                avg_relevance_score=0.0,
+                avg_confidence_score=0.0,
+                improvement_trend=0.0,
+                top_sources=[],
+                confidence_threshold=agent_orchestrator.learning_engine.get_confidence_threshold() if agent_orchestrator and agent_orchestrator.learning_engine else 0.5,
+                memory_stats={
+                    "total_memories": 0,
+                    "avg_relevance": 0.0,
+                    "high_quality_memories": 0,
+                    "memory_size_bytes": 0
+                },
+                queries_last_hour=0,
+                queries_last_day=0
+            )
+        
+        # Requirement 7.1: Calculate total queries, average relevance, average confidence
+        total_queries = len(all_memories)
+        
+        # Calculate average relevance score
+        relevance_scores = [m.relevance_score for m in all_memories]
+        avg_relevance_score = float(sum(relevance_scores) / len(relevance_scores))
+        
+        # Calculate average confidence score (using relevance as proxy for confidence)
+        # In a full implementation, we'd store actual confidence scores
+        avg_confidence_score = avg_relevance_score
+        
+        # Requirement 7.3: Detect improvement trends
+        # Compare recent queries (last 10) vs older queries (10-20)
+        improvement_trend = 0.0
+        if len(all_memories) >= 20:
+            recent_10 = all_memories[:10]
+            older_10 = all_memories[10:20]
+            
+            recent_avg = sum(m.relevance_score for m in recent_10) / len(recent_10)
+            older_avg = sum(m.relevance_score for m in older_10) / len(older_10)
+            
+            # Positive trend = improving
+            improvement_trend = float(recent_avg - older_avg)
+        elif len(all_memories) >= 10:
+            # Not enough data for comparison, but check if recent is above threshold
+            recent_avg = sum(m.relevance_score for m in all_memories[:10]) / 10
+            improvement_trend = float(recent_avg - 0.5)  # Compare to baseline
+        
+        # Requirement 7.2: Get top performing API sources
+        top_sources = []
+        if agent_orchestrator and agent_orchestrator.learning_engine:
+            try:
+                source_metrics = await agent_orchestrator.learning_engine.analyze_source_performance(
+                    lookback_queries=min(100, total_queries)
+                )
+                
+                # Sort by priority score and take top 5
+                sorted_sources = sorted(
+                    source_metrics.values(),
+                    key=lambda m: m.priority_score,
+                    reverse=True
+                )[:5]
+                
+                # Convert to response model
+                for source in sorted_sources:
+                    top_sources.append(models.SourceMetrics(
+                        api_id=source.api_id,
+                        api_name=source.api_name,
+                        total_uses=source.total_uses,
+                        success_rate=source.success_rate,
+                        avg_relevance=source.avg_relevance,
+                        avg_response_time_ms=0.0,  # Not tracked yet
+                        priority_score=source.priority_score
+                    ))
+            except Exception as e:
+                logger.warning("source_metrics_calculation_error", error=str(e))
+        
+        # Get current confidence threshold
+        confidence_threshold = 0.5
+        if agent_orchestrator and agent_orchestrator.learning_engine:
+            confidence_threshold = agent_orchestrator.learning_engine.get_confidence_threshold()
+        
+        # Get memory statistics
+        memory_metrics = await memory_store.get_metrics()
+        memory_stats = {
+            "total_memories": memory_metrics.total_memories,
+            "avg_relevance": memory_metrics.avg_relevance,
+            "high_quality_memories": memory_metrics.high_quality_memories,
+            "memory_size_bytes": memory_metrics.memory_size_bytes
+        }
+        
+        # Calculate queries in last hour and last day
+        one_hour_ago = current_time - 3600
+        one_day_ago = current_time - 86400
+        
+        queries_last_hour = sum(1 for m in all_memories if m.timestamp >= one_hour_ago)
+        queries_last_day = sum(1 for m in all_memories if m.timestamp >= one_day_ago)
+        
+        # Build response
+        response = models.MetricsResponse(
+            total_queries=total_queries,
+            avg_relevance_score=avg_relevance_score,
+            avg_confidence_score=avg_confidence_score,
+            improvement_trend=improvement_trend,
+            top_sources=top_sources,
+            confidence_threshold=confidence_threshold,
+            memory_stats=memory_stats,
+            queries_last_hour=queries_last_hour,
+            queries_last_day=queries_last_day
+        )
+        
+        # Requirement 7.4: Log metric snapshots
+        logger.info(
+            "metrics_calculated",
+            total_queries=total_queries,
+            avg_relevance_score=avg_relevance_score,
+            improvement_trend=improvement_trend,
+            confidence_threshold=confidence_threshold,
+            queries_last_hour=queries_last_hour,
+            queries_last_day=queries_last_day
+        )
+        
+        return response
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    
+    except Exception as e:
+        logger.error(
+            "metrics_calculation_error",
+            error=str(e),
+            error_type=type(e).__name__
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while calculating metrics."
+        )
+
+
+# History Endpoint
+@app.get("/api/research/history", response_model=models.HistoryResponse)
+async def get_history(
+    limit: int = 50,
+    offset: int = 0,
+    min_relevance: float = 0.0
+):
+    """
+    Get past queries with pagination.
+    
+    Requirements:
+    - 12.3: GET endpoint returning past queries with pagination
+    
+    Args:
+        limit: Maximum number of queries to return (default: 50)
+        offset: Number of queries to skip (default: 0)
+        min_relevance: Minimum relevance score filter (default: 0.0)
+        
+    Returns:
+        HistoryResponse: List of past queries with pagination info
+        
+    Raises:
+        HTTPException: If history retrieval fails
+    """
+    # Check if memory store is initialized
+    if not memory_store:
+        logger.error("memory_store_not_initialized_for_history")
+        raise HTTPException(
+            status_code=503,
+            detail="Service not ready. Memory store not initialized."
+        )
+    
+    logger.info(
+        "history_requested",
+        limit=limit,
+        offset=offset,
+        min_relevance=min_relevance
+    )
+    
+    try:
+        # Get all recent memories (we'll handle pagination manually)
+        # Get more than needed to account for offset
+        fetch_limit = limit + offset + 100
+        all_memories = await memory_store.get_recent(
+            limit=fetch_limit,
+            min_relevance=min_relevance
+        )
+        
+        # Get total count
+        total = len(all_memories)
+        
+        # Apply pagination
+        paginated_memories = all_memories[offset:offset + limit]
+        
+        # Convert to HistoryEntry models
+        history_entries = []
+        for mem in paginated_memories:
+            # Extract confidence score from results if available
+            confidence_score = mem.relevance_score  # Use relevance as proxy
+            if isinstance(mem.results, dict):
+                confidence_score = mem.results.get("confidence_score", mem.relevance_score)
+            
+            history_entries.append(models.HistoryEntry(
+                query_id=mem.memory_id,
+                query=mem.query,
+                timestamp=mem.timestamp,
+                relevance_score=mem.relevance_score,
+                confidence_score=confidence_score,
+                sources_count=len(mem.api_sources),
+                session_id=mem.session_id
+            ))
+        
+        # Build response
+        response = models.HistoryResponse(
+            total=total,
+            limit=limit,
+            offset=offset,
+            queries=history_entries
+        )
+        
+        logger.info(
+            "history_retrieved",
+            total=total,
+            returned=len(history_entries),
+            limit=limit,
+            offset=offset
+        )
+        
+        return response
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    
+    except Exception as e:
+        logger.error(
+            "history_retrieval_error",
+            error=str(e),
+            error_type=type(e).__name__
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while retrieving history."
+        )
+
+
+# Reports List Endpoint
+@app.get("/api/reports", response_model=models.ReportsListResponse)
+async def list_reports(limit: int = 20):
+    """
+    List generated reports.
+    
+    Requirements:
+    - 12.5: GET endpoint to list generated reports
+    
+    Args:
+        limit: Maximum number of reports to return (default: 20)
+        
+    Returns:
+        ReportsListResponse: List of report metadata
+        
+    Raises:
+        HTTPException: If report listing fails
+    """
+    logger.info("reports_list_requested", limit=limit)
+    
+    try:
+        # Get reports directory
+        reports_dir = Path(Config.REPORT_OUTPUT_DIR)
+        
+        if not reports_dir.exists():
+            logger.warning("reports_directory_not_found", path=str(reports_dir))
+            return models.ReportsListResponse(
+                total=0,
+                reports=[]
+            )
+        
+        # Get all markdown files in reports directory
+        all_report_files = list(reports_dir.glob("research_report_*.md"))
+        
+        # Sort by filename (which contains timestamp) - newest first
+        all_report_files = sorted(
+            all_report_files,
+            key=lambda p: p.name,
+            reverse=True
+        )
+        
+        # Limit results
+        report_files = all_report_files[:limit]
+        
+        # Build report metadata list
+        reports_metadata = []
+        for report_file in report_files:
+            try:
+                # Extract timestamp from filename
+                # Format: research_report_2025-11-22_11-26-48.md
+                filename = report_file.name
+                timestamp_str = filename.replace("research_report_", "").replace(".md", "")
+                
+                # Read first few lines to extract query and confidence
+                content = report_file.read_text(encoding='utf-8')
+                lines = content.split('\n')
+                
+                # Extract query from title (first line)
+                query = "Unknown Query"
+                if lines and lines[0].startswith("# Research Report:"):
+                    query = lines[0].replace("# Research Report:", "").strip()
+                
+                # Extract confidence score
+                confidence_score = 0.5
+                for line in lines[:10]:  # Check first 10 lines
+                    if "**Confidence Score:**" in line:
+                        try:
+                            confidence_str = line.split("**Confidence Score:**")[1].strip()
+                            confidence_score = float(confidence_str)
+                        except (IndexError, ValueError):
+                            pass
+                        break
+                
+                # Generate report ID
+                report_id = f"report_{timestamp_str}"
+                
+                # Get file size
+                file_size = report_file.stat().st_size
+                
+                reports_metadata.append(models.ReportMetadata(
+                    report_id=report_id,
+                    filename=filename,
+                    query=query,
+                    timestamp=timestamp_str,
+                    file_size_bytes=file_size,
+                    confidence_score=confidence_score
+                ))
+                
+            except Exception as e:
+                logger.warning(
+                    "report_metadata_extraction_error",
+                    filename=report_file.name,
+                    error=str(e)
+                )
+                continue
+        
+        # Build response (total is all files, not just returned)
+        response = models.ReportsListResponse(
+            total=len(all_report_files),
+            reports=reports_metadata
+        )
+        
+        logger.info(
+            "reports_listed",
+            total=len(reports_metadata),
+            limit=limit
+        )
+        
+        return response
+        
+    except Exception as e:
+        logger.error(
+            "reports_list_error",
+            error=str(e),
+            error_type=type(e).__name__
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while listing reports."
+        )
+
+
+# Get Specific Report Endpoint
+@app.get("/api/reports/{report_id}", response_model=models.ReportContent)
+async def get_report(report_id: str):
+    """
+    Get specific report content.
+    
+    Requirements:
+    - 12.5: GET endpoint to retrieve specific report
+    
+    Args:
+        report_id: Report identifier (format: report_YYYY-MM-DD_HH-MM-SS)
+        
+    Returns:
+        ReportContent: Full report content with metadata
+        
+    Raises:
+        HTTPException: If report not found or retrieval fails
+    """
+    logger.info("report_requested", report_id=report_id)
+    
+    try:
+        # Extract timestamp from report_id
+        # Format: report_2025-11-22_11-26-48
+        if not report_id.startswith("report_"):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid report ID format. Expected: report_YYYY-MM-DD_HH-MM-SS"
+            )
+        
+        timestamp_str = report_id.replace("report_", "")
+        filename = f"research_report_{timestamp_str}.md"
+        
+        # Get reports directory
+        reports_dir = Path(Config.REPORT_OUTPUT_DIR)
+        report_path = reports_dir / filename
+        
+        # Check if report exists
+        if not report_path.exists():
+            logger.warning("report_not_found", report_id=report_id, path=str(report_path))
+            raise HTTPException(
+                status_code=404,
+                detail=f"Report not found: {report_id}"
+            )
+        
+        # Read report content
+        content = report_path.read_text(encoding='utf-8')
+        
+        # Extract metadata from content
+        lines = content.split('\n')
+        
+        # Extract query from title
+        query = "Unknown Query"
+        if lines and lines[0].startswith("# Research Report:"):
+            query = lines[0].replace("# Research Report:", "").strip()
+        
+        # Extract confidence score
+        confidence_score = 0.5
+        for line in lines[:10]:
+            if "**Confidence Score:**" in line:
+                try:
+                    confidence_str = line.split("**Confidence Score:**")[1].strip()
+                    confidence_score = float(confidence_str)
+                except (IndexError, ValueError):
+                    pass
+                break
+        
+        # Get file size
+        file_size = report_path.stat().st_size
+        
+        # Build metadata
+        metadata = models.ReportMetadata(
+            report_id=report_id,
+            filename=filename,
+            query=query,
+            timestamp=timestamp_str,
+            file_size_bytes=file_size,
+            confidence_score=confidence_score
+        )
+        
+        # Build response
+        response = models.ReportContent(
+            report_id=report_id,
+            filename=filename,
+            content=content,
+            metadata=metadata
+        )
+        
+        logger.info(
+            "report_retrieved",
+            report_id=report_id,
+            size_bytes=file_size
+        )
+        
+        return response
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    
+    except Exception as e:
+        logger.error(
+            "report_retrieval_error",
+            report_id=report_id,
+            error=str(e),
+            error_type=type(e).__name__
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while retrieving the report."
         )
 
 
