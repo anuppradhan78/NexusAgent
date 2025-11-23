@@ -277,3 +277,43 @@ class ErrorResponse(BaseModel):
     message: str = Field(..., description="Error message")
     request_id: Optional[str] = Field(None, description="Request ID for tracing")
     details: Optional[Dict[str, Any]] = Field(None, description="Additional error details")
+
+
+class ScheduleItem(BaseModel):
+    """
+    Scheduled query item.
+    
+    Requirements: 13.6 - Schedule information model
+    """
+    schedule_id: str = Field(..., description="Unique schedule identifier")
+    query: str = Field(..., description="Scheduled query text")
+    cron_expression: str = Field(..., description="Cron expression for scheduling")
+    enabled: bool = Field(..., description="Whether schedule is active")
+    alert_on_change: bool = Field(..., description="Whether to alert on changes")
+    max_sources: int = Field(..., description="Maximum API sources")
+    created_at: float = Field(..., description="Creation timestamp")
+    last_run: Optional[float] = Field(None, description="Last execution timestamp")
+    execution_count: int = Field(..., description="Number of executions")
+    next_run: str = Field(..., description="Next scheduled run time")
+
+
+class ScheduleListResponse(BaseModel):
+    """
+    Response for listing schedules.
+    
+    Requirements: 13.6 - List schedules response model
+    """
+    total: int = Field(..., description="Total number of schedules")
+    schedules: List[ScheduleItem] = Field(default_factory=list, description="List of schedules")
+
+
+class ScheduleUpdateRequest(BaseModel):
+    """
+    Request to update a scheduled query.
+    
+    Requirements: 13.6 - Update schedule request model
+    """
+    enabled: Optional[bool] = Field(None, description="New enabled status")
+    cron_expression: Optional[str] = Field(None, description="New cron expression")
+    alert_on_change: Optional[bool] = Field(None, description="New alert setting")
+    max_sources: Optional[int] = Field(None, ge=1, le=10, description="New max sources")

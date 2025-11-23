@@ -24,6 +24,7 @@ from memory_store import MemoryStore, MemoryEntry
 from learning_engine import LearningEngine, RefinedQuery
 from alert_engine import AlertEngine, Alert
 from report_generator import ReportGenerator, ReportPath
+from session_manager import SessionManager, QueryHistoryItem
 
 logger = structlog.get_logger()
 
@@ -157,7 +158,8 @@ class AgentOrchestrator:
         memory_store: MemoryStore,
         learning_engine: Optional[LearningEngine] = None,
         alert_engine: Optional[AlertEngine] = None,
-        report_generator: Optional[ReportGenerator] = None
+        report_generator: Optional[ReportGenerator] = None,
+        session_manager: Optional[SessionManager] = None
     ):
         """
         Initialize agent orchestrator with dependencies.
@@ -168,12 +170,14 @@ class AgentOrchestrator:
             learning_engine: Optional learning engine for query refinement
             alert_engine: Optional alert engine for notifications
             report_generator: Optional report generator for creating reports
+            session_manager: Optional session manager for multi-turn conversations
         """
         self.mcp_client = mcp_client
         self.memory_store = memory_store
         self.learning_engine = learning_engine or LearningEngine(memory_store, mcp_client)
         self.alert_engine = alert_engine or AlertEngine(mcp_client)
         self.report_generator = report_generator or ReportGenerator()
+        self.session_manager = session_manager
         
         logger.info("agent_orchestrator_initialized")
     
@@ -229,6 +233,27 @@ class AgentOrchestrator:
             # Step 2: Get embedding and retrieve similar past queries
             logger.info("step_2_retrieving_memory", query_id=query_id)
             query_embedding = await self._get_embedding(query)
+            
+            # Retrieve session history if available
+            # Requirements: 15.1, 15.2 - Use previous query results as context
+            session_history = []
+            if session_id and self.session_manager:
+                try:
+                    session_history = self.session_manager.get_session_history(session_id)
+                    logger.info(
+                        "session_history_retrieved",
+                        query_id=query_id,
+                        session_id=session_id,
+                        history_count=len(session_history)
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "session_history_retrieval_failed",
+                        query_id=query_id,
+                        session_id=session_id,
+                        error=str(e)
+                    )
+            
             similar_queries = await self.memory_store.find_similar(
                 query_embedding=query_embedding,
                 top_k=5,
@@ -239,7 +264,8 @@ class AgentOrchestrator:
             logger.info(
                 "similar_queries_found",
                 query_id=query_id,
-                count=len(similar_queries)
+                count=len(similar_queries),
+                session_history_count=len(session_history)
             )
             
             # Step 2.5: Apply query refinements from learning engine
@@ -282,12 +308,14 @@ class AgentOrchestrator:
             )
             
             # Step 5: Synthesize results using Claude
+            # Requirements: 15.2 - Use previous query results as context
             logger.info("step_5_synthesizing_results", query_id=query_id)
             synthesis = await self._synthesize_results(
                 query=query,
                 intent=intent,
                 api_results=api_results,
-                similar_queries=similar_queries
+                similar_queries=similar_queries,
+                session_history=session_history if 'session_history' in locals() else []
             )
             
             # Step 5.5: Evaluate for alerts
@@ -831,7 +859,8 @@ Respond ONLY with valid JSON, no additional text."""
         query: str,
         intent: QueryIntent,
         api_results: List[APIResult],
-        similar_queries: List[MemoryEntry]
+        similar_queries: List[MemoryEntry],
+        session_history: Optional[List[QueryHistoryItem]] = None
     ) -> ResearchSynthesis:
         """
         Synthesize information from multiple sources using Claude.
@@ -840,12 +869,14 @@ Respond ONLY with valid JSON, no additional text."""
         - 1.3: Use Claude to synthesize information from multiple sources
         - 1.4: Include source citations with confidence scores
         - 8.3: Use Claude to generate natural language summaries
+        - 15.2: Use previous query results as context for follow-up questions
         
         Args:
             query: Original query
             intent: Parsed query intent
             api_results: Results from API calls
             similar_queries: Similar past queries from memory
+            session_history: Optional session history for multi-turn context
             
         Returns:
             ResearchSynthesis: Synthesized research results
@@ -864,6 +895,10 @@ Respond ONLY with valid JSON, no additional text."""
             # Prepare context from similar queries
             memory_context = self._format_memory_context(similar_queries)
             
+            # Prepare context from session history
+            # Requirements: 15.2 - Use previous query results as context
+            session_context = self._format_session_context(session_history or [])
+            
             # Create synthesis prompt
             prompt = f"""Synthesize research findings from multiple sources into a comprehensive response.
 
@@ -877,6 +912,9 @@ API Results:
 
 Similar Past Research:
 {memory_context}
+
+Conversation History (if this is a follow-up question):
+{session_context}
 
 Provide a JSON response with:
 1. summary: Executive summary (2-3 sentences)
@@ -1004,6 +1042,39 @@ Respond ONLY with valid JSON, no additional text."""
                     formatted.append(f"Summary: {summary[:200]}...")
             
             formatted.append("-" * 60)
+        
+        return "\n".join(formatted)
+    
+    def _format_session_context(self, session_history: List[QueryHistoryItem]) -> str:
+        """
+        Format session history for synthesis prompt.
+        
+        Requirements: 15.2, 15.3 - Use previous query results as context
+        
+        Args:
+            session_history: List of previous queries in this session
+            
+        Returns:
+            str: Formatted session context
+        """
+        if not session_history:
+            return "No previous conversation history (this is the first query in the session)."
+        
+        formatted = []
+        formatted.append("Previous queries in this conversation:")
+        
+        # Show last 3 queries for context
+        recent_history = session_history[-3:] if len(session_history) > 3 else session_history
+        
+        for i, item in enumerate(recent_history, 1):
+            formatted.append(f"\n{i}. Previous Query: {item.query}")
+            formatted.append(f"   Answer: {item.synthesized_answer[:300]}...")
+            formatted.append(f"   Confidence: {item.confidence_score:.2f}")
+            formatted.append(f"   Sources: {', '.join(item.sources)}")
+            formatted.append("-" * 60)
+        
+        if len(session_history) > 3:
+            formatted.append(f"\n(Showing last 3 of {len(session_history)} queries in this session)")
         
         return "\n".join(formatted)
     

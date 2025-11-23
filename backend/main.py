@@ -2,10 +2,12 @@
 Adaptive Research Agent - Main FastAPI Application
 """
 import os
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 from pathlib import Path
+from datetime import datetime
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,13 +22,18 @@ from models import (
     ResearchResponse,
     APISource,
     MemoryEntry,
-    ErrorResponse
+    ErrorResponse,
+    ScheduleRequest,
+    ScheduleResponse
 )
 from agent_orchestrator import AgentOrchestrator, AgentOrchestratorError
 from mcp_client import MCPClient, MCPConnectionError
 from memory_store import MemoryStore, MemoryStoreError
 from alert_engine import AlertEngine
 from report_generator import ReportGenerator
+from scheduler import QueryScheduler, SchedulerError
+from session_manager import SessionManager, SessionManagerError
+from log_manager import LogManager, LogQuery, initialize_log_manager, get_log_manager
 
 # Load environment variables
 load_dotenv()
@@ -94,13 +101,16 @@ memory_store: Optional[MemoryStore] = None
 alert_engine: Optional[AlertEngine] = None
 report_generator: Optional[ReportGenerator] = None
 agent_orchestrator: Optional[AgentOrchestrator] = None
+query_scheduler: Optional[QueryScheduler] = None
+session_manager: Optional[SessionManager] = None
+log_manager: Optional[LogManager] = None
 
 
 # Lifespan context manager for startup/shutdown events
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Handle application startup and shutdown"""
-    global mcp_client, memory_store, alert_engine, report_generator, agent_orchestrator
+    global mcp_client, memory_store, alert_engine, report_generator, agent_orchestrator, query_scheduler, session_manager, log_manager
     
     # Startup
     logger.info(
@@ -125,6 +135,16 @@ async def lifespan(app: FastAPI):
     
     # Initialize components
     try:
+        # Initialize log manager first
+        # Requirements: 14.1, 14.2 - Comprehensive logging with request ID tracing
+        logger.info("initializing_log_manager")
+        log_manager = initialize_log_manager(
+            redis_url=Config.REDIS_URL,
+            redis_password=Config.REDIS_PASSWORD if Config.REDIS_PASSWORD else None,
+            log_retention_days=7
+        )
+        logger.info("log_manager_initialized")
+        
         # Initialize MCP client
         logger.info("initializing_mcp_client")
         mcp_client = MCPClient()
@@ -149,15 +169,33 @@ async def lifespan(app: FastAPI):
         report_generator = ReportGenerator(output_dir=Config.REPORT_OUTPUT_DIR)
         logger.info("report_generator_initialized")
         
+        # Initialize session manager (before agent orchestrator)
+        logger.info("initializing_session_manager")
+        session_manager = SessionManager(
+            redis_url=Config.REDIS_URL,
+            redis_password=Config.REDIS_PASSWORD if Config.REDIS_PASSWORD else None
+        )
+        logger.info("session_manager_initialized")
+        
         # Initialize agent orchestrator
         logger.info("initializing_agent_orchestrator")
         agent_orchestrator = AgentOrchestrator(
             mcp_client=mcp_client,
             memory_store=memory_store,
             alert_engine=alert_engine,
-            report_generator=report_generator
+            report_generator=report_generator,
+            session_manager=session_manager
         )
         logger.info("agent_orchestrator_initialized")
+        
+        # Initialize query scheduler
+        logger.info("initializing_query_scheduler")
+        query_scheduler = QueryScheduler(
+            agent_orchestrator=agent_orchestrator,
+            memory_store=memory_store
+        )
+        await query_scheduler.start()
+        logger.info("query_scheduler_initialized")
         
     except Exception as e:
         logger.error(
@@ -176,6 +214,24 @@ async def lifespan(app: FastAPI):
     logger.info("application_shutting_down")
     
     # Cleanup
+    if query_scheduler:
+        try:
+            await query_scheduler.stop()
+        except Exception as e:
+            logger.warning("query_scheduler_stop_error", error=str(e))
+    
+    if session_manager:
+        try:
+            session_manager.close()
+        except Exception as e:
+            logger.warning("session_manager_close_error", error=str(e))
+    
+    if log_manager:
+        try:
+            log_manager.close()
+        except Exception as e:
+            logger.warning("log_manager_close_error", error=str(e))
+    
     if mcp_client:
         try:
             await mcp_client.close()
@@ -258,6 +314,8 @@ async def research_query(request: ResearchRequest):
     - 1.3: Synthesize information from multiple sources
     - 1.4: Include source citations with confidence scores
     - 1.5: Handle API failures gracefully
+    - 15.1: Maintain conversation context across multiple queries
+    - 15.5: Support session management with unique session IDs
     
     Args:
         request: ResearchRequest with query and options
@@ -276,19 +334,33 @@ async def research_query(request: ResearchRequest):
             detail="Service not ready. Agent orchestrator not initialized."
         )
     
+    # Handle session management
+    # Requirements: 15.1, 15.5 - Maintain conversation context with session IDs
+    session_id = request.session_id
+    if session_id and session_manager:
+        # Verify session exists, create if not
+        session_context = session_manager.get_session(session_id)
+        if not session_context:
+            logger.info("session_not_found_creating_new", session_id=session_id)
+            session_id = session_manager.create_session()
+    elif not session_id and session_manager:
+        # Create new session if none provided
+        session_id = session_manager.create_session()
+        logger.info("new_session_created", session_id=session_id)
+    
     logger.info(
         "research_query_received",
         query=request.query[:100],
-        session_id=request.session_id,
+        session_id=session_id,
         max_sources=request.max_sources
     )
     
     try:
         # Process query through agent orchestrator
-        # Requirements: 5.1, 6.1, 12.1 - Include alerts and reports
+        # Requirements: 5.1, 6.1, 12.1, 15.1 - Include alerts, reports, and session context
         result = await agent_orchestrator.process_query(
             query=request.query,
-            session_id=request.session_id,
+            session_id=session_id,
             max_sources=request.max_sources,
             timeout=30,
             include_report=request.include_report,
@@ -329,11 +401,37 @@ async def research_query(request: ResearchRequest):
                 session_id=mem.session_id
             ))
         
+        # Add query to session history
+        # Requirements: 15.1, 15.4 - Store conversation history
+        if session_id and session_manager:
+            try:
+                session_manager.add_query_to_session(
+                    session_id=session_id,
+                    query_id=result.query_id,
+                    query=request.query,
+                    synthesized_answer=result.synthesis.summary,
+                    sources=[s.api_id for s in api_sources],
+                    confidence_score=result.synthesis.confidence_score,
+                    memory_id=result.memory_id
+                )
+                logger.info(
+                    "query_added_to_session",
+                    session_id=session_id,
+                    query_id=result.query_id
+                )
+            except SessionManagerError as e:
+                # Log but don't fail the request
+                logger.warning(
+                    "failed_to_add_query_to_session",
+                    session_id=session_id,
+                    error=str(e)
+                )
+        
         # Build response
-        # Requirements: 12.1 - Include alert status and report path in API response
+        # Requirements: 12.1, 15.5 - Include alert status, report path, and session ID
         response = ResearchResponse(
             query_id=result.query_id,
-            session_id=request.session_id or result.query_id,
+            session_id=session_id or result.query_id,
             synthesized_answer=result.synthesis.summary,
             detailed_analysis=result.synthesis.detailed_analysis,
             findings=result.synthesis.findings,
@@ -352,6 +450,7 @@ async def research_query(request: ResearchRequest):
         logger.info(
             "research_query_completed",
             query_id=result.query_id,
+            session_id=session_id,
             processing_time_ms=result.processing_time_ms,
             confidence_score=result.synthesis.confidence_score,
             sources_count=len(api_sources),
@@ -1073,6 +1172,665 @@ async def get_report(report_id: str):
         raise HTTPException(
             status_code=500,
             detail="An unexpected error occurred while retrieving the report."
+        )
+
+
+# Schedule Endpoints
+@app.post("/api/schedule", response_model=ScheduleResponse)
+async def create_schedule(request: ScheduleRequest):
+    """
+    Create a scheduled recurring query.
+    
+    Requirements:
+    - 13.1: Accept scheduled queries with cron-like expressions
+    - 13.6: Allow users to enable/disable/modify scheduled queries
+    
+    Args:
+        request: ScheduleRequest with query and cron expression
+        
+    Returns:
+        ScheduleResponse: Created schedule information
+        
+    Raises:
+        HTTPException: If schedule creation fails
+    """
+    # Check if query scheduler is initialized
+    if not query_scheduler:
+        logger.error("query_scheduler_not_initialized")
+        raise HTTPException(
+            status_code=503,
+            detail="Service not ready. Query scheduler not initialized."
+        )
+    
+    logger.info(
+        "schedule_creation_requested",
+        query=request.query[:100],
+        cron_expression=request.cron_expression,
+        enabled=request.enabled
+    )
+    
+    try:
+        # Create schedule
+        schedule = await query_scheduler.create_schedule(
+            query=request.query,
+            cron_expression=request.cron_expression,
+            enabled=request.enabled,
+            alert_on_change=request.alert_on_change,
+            max_sources=request.max_sources
+        )
+        
+        # Get next run time
+        next_run = query_scheduler.get_next_run_time(schedule.schedule_id)
+        next_run_str = next_run.isoformat() if next_run else "Not scheduled"
+        
+        # Build response
+        response = ScheduleResponse(
+            schedule_id=schedule.schedule_id,
+            query=schedule.query,
+            cron_expression=schedule.cron_expression,
+            next_run=next_run_str,
+            enabled=schedule.enabled
+        )
+        
+        logger.info(
+            "schedule_created",
+            schedule_id=schedule.schedule_id,
+            next_run=next_run_str
+        )
+        
+        return response
+        
+    except SchedulerError as e:
+        logger.error(
+            "schedule_creation_failed",
+            error=str(e),
+            query=request.query[:100]
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=str(e)
+        )
+    
+    except Exception as e:
+        logger.error(
+            "schedule_creation_error",
+            error=str(e),
+            error_type=type(e).__name__
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while creating schedule."
+        )
+
+
+@app.get("/api/schedule", response_model=models.ScheduleListResponse)
+async def list_schedules():
+    """
+    List all scheduled queries.
+    
+    Requirements: 13.6 - Allow users to view scheduled queries
+    
+    Returns:
+        ScheduleListResponse: List of all schedules
+        
+    Raises:
+        HTTPException: If listing fails
+    """
+    # Check if query scheduler is initialized
+    if not query_scheduler:
+        logger.error("query_scheduler_not_initialized")
+        raise HTTPException(
+            status_code=503,
+            detail="Service not ready. Query scheduler not initialized."
+        )
+    
+    logger.info("schedules_list_requested")
+    
+    try:
+        schedules = await query_scheduler.list_schedules()
+        
+        # Convert to response models
+        schedule_items = []
+        for schedule in schedules:
+            next_run = query_scheduler.get_next_run_time(schedule.schedule_id)
+            next_run_str = next_run.isoformat() if next_run else "Not scheduled"
+            
+            schedule_items.append(models.ScheduleItem(
+                schedule_id=schedule.schedule_id,
+                query=schedule.query,
+                cron_expression=schedule.cron_expression,
+                enabled=schedule.enabled,
+                alert_on_change=schedule.alert_on_change,
+                max_sources=schedule.max_sources,
+                created_at=schedule.created_at,
+                last_run=schedule.last_run,
+                execution_count=schedule.execution_count,
+                next_run=next_run_str
+            ))
+        
+        response = models.ScheduleListResponse(
+            total=len(schedule_items),
+            schedules=schedule_items
+        )
+        
+        logger.info("schedules_listed", count=len(schedule_items))
+        
+        return response
+        
+    except Exception as e:
+        logger.error(
+            "schedules_list_error",
+            error=str(e),
+            error_type=type(e).__name__
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while listing schedules."
+        )
+
+
+@app.get("/api/schedule/{schedule_id}", response_model=models.ScheduleItem)
+async def get_schedule(schedule_id: str):
+    """
+    Get a specific scheduled query.
+    
+    Requirements: 13.6 - Allow users to view scheduled queries
+    
+    Args:
+        schedule_id: Schedule identifier
+        
+    Returns:
+        ScheduleItem: Schedule details
+        
+    Raises:
+        HTTPException: If schedule not found
+    """
+    # Check if query scheduler is initialized
+    if not query_scheduler:
+        logger.error("query_scheduler_not_initialized")
+        raise HTTPException(
+            status_code=503,
+            detail="Service not ready. Query scheduler not initialized."
+        )
+    
+    logger.info("schedule_get_requested", schedule_id=schedule_id)
+    
+    try:
+        schedule = await query_scheduler.get_schedule(schedule_id)
+        
+        if not schedule:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Schedule not found: {schedule_id}"
+            )
+        
+        next_run = query_scheduler.get_next_run_time(schedule.schedule_id)
+        next_run_str = next_run.isoformat() if next_run else "Not scheduled"
+        
+        response = models.ScheduleItem(
+            schedule_id=schedule.schedule_id,
+            query=schedule.query,
+            cron_expression=schedule.cron_expression,
+            enabled=schedule.enabled,
+            alert_on_change=schedule.alert_on_change,
+            max_sources=schedule.max_sources,
+            created_at=schedule.created_at,
+            last_run=schedule.last_run,
+            execution_count=schedule.execution_count,
+            next_run=next_run_str
+        )
+        
+        logger.info("schedule_retrieved", schedule_id=schedule_id)
+        
+        return response
+        
+    except HTTPException:
+        raise
+    
+    except Exception as e:
+        logger.error(
+            "schedule_get_error",
+            schedule_id=schedule_id,
+            error=str(e),
+            error_type=type(e).__name__
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while retrieving schedule."
+        )
+
+
+@app.put("/api/schedule/{schedule_id}", response_model=ScheduleResponse)
+async def update_schedule(schedule_id: str, request: models.ScheduleUpdateRequest):
+    """
+    Update a scheduled query.
+    
+    Requirements: 13.6 - Allow users to enable/disable/modify scheduled queries
+    
+    Args:
+        schedule_id: Schedule identifier
+        request: ScheduleUpdateRequest with fields to update
+        
+    Returns:
+        ScheduleResponse: Updated schedule information
+        
+    Raises:
+        HTTPException: If update fails
+    """
+    # Check if query scheduler is initialized
+    if not query_scheduler:
+        logger.error("query_scheduler_not_initialized")
+        raise HTTPException(
+            status_code=503,
+            detail="Service not ready. Query scheduler not initialized."
+        )
+    
+    logger.info("schedule_update_requested", schedule_id=schedule_id)
+    
+    try:
+        # Update schedule
+        schedule = await query_scheduler.update_schedule(
+            schedule_id=schedule_id,
+            enabled=request.enabled,
+            cron_expression=request.cron_expression,
+            alert_on_change=request.alert_on_change,
+            max_sources=request.max_sources
+        )
+        
+        # Get next run time
+        next_run = query_scheduler.get_next_run_time(schedule.schedule_id)
+        next_run_str = next_run.isoformat() if next_run else "Not scheduled"
+        
+        # Build response
+        response = ScheduleResponse(
+            schedule_id=schedule.schedule_id,
+            query=schedule.query,
+            cron_expression=schedule.cron_expression,
+            next_run=next_run_str,
+            enabled=schedule.enabled
+        )
+        
+        logger.info(
+            "schedule_updated",
+            schedule_id=schedule_id,
+            enabled=schedule.enabled
+        )
+        
+        return response
+        
+    except SchedulerError as e:
+        logger.error(
+            "schedule_update_failed",
+            schedule_id=schedule_id,
+            error=str(e)
+        )
+        raise HTTPException(
+            status_code=400 if "not found" in str(e).lower() else 400,
+            detail=str(e)
+        )
+    
+    except Exception as e:
+        logger.error(
+            "schedule_update_error",
+            schedule_id=schedule_id,
+            error=str(e),
+            error_type=type(e).__name__
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while updating schedule."
+        )
+
+
+@app.delete("/api/schedule/{schedule_id}")
+async def delete_schedule(schedule_id: str):
+    """
+    Delete a scheduled query.
+    
+    Requirements: 13.6 - Allow users to enable/disable/modify scheduled queries
+    
+    Args:
+        schedule_id: Schedule identifier
+        
+    Returns:
+        Success message
+        
+    Raises:
+        HTTPException: If deletion fails
+    """
+    # Check if query scheduler is initialized
+    if not query_scheduler:
+        logger.error("query_scheduler_not_initialized")
+        raise HTTPException(
+            status_code=503,
+            detail="Service not ready. Query scheduler not initialized."
+        )
+    
+    logger.info("schedule_deletion_requested", schedule_id=schedule_id)
+    
+    try:
+        success = await query_scheduler.delete_schedule(schedule_id)
+        
+        if not success:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Schedule not found: {schedule_id}"
+            )
+        
+        logger.info("schedule_deleted", schedule_id=schedule_id)
+        
+        return {"success": True, "message": "Schedule deleted successfully"}
+        
+    except HTTPException:
+        raise
+    
+    except SchedulerError as e:
+        logger.error(
+            "schedule_deletion_failed",
+            schedule_id=schedule_id,
+            error=str(e)
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=str(e)
+        )
+    
+    except Exception as e:
+        logger.error(
+            "schedule_deletion_error",
+            schedule_id=schedule_id,
+            error=str(e),
+            error_type=type(e).__name__
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while deleting schedule."
+        )
+
+
+# Session Management Endpoints
+@app.post("/api/session")
+async def create_session():
+    """
+    Create a new conversation session.
+    
+    Requirements: 15.5 - Support session management with unique session IDs
+    
+    Returns:
+        Session information with session_id
+        
+    Raises:
+        HTTPException: If session creation fails
+    """
+    # Check if session manager is initialized
+    if not session_manager:
+        logger.error("session_manager_not_initialized")
+        raise HTTPException(
+            status_code=503,
+            detail="Service not ready. Session manager not initialized."
+        )
+    
+    logger.info("session_creation_requested")
+    
+    try:
+        session_id = session_manager.create_session()
+        
+        logger.info("session_created_via_endpoint", session_id=session_id)
+        
+        return {
+            "session_id": session_id,
+            "created_at": time.time(),
+            "expiration_seconds": session_manager.session_expiration_seconds
+        }
+        
+    except SessionManagerError as e:
+        logger.error("session_creation_failed", error=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create session: {str(e)}"
+        )
+
+
+@app.get("/api/session/{session_id}/history")
+async def get_session_history(session_id: str):
+    """
+    Get query history for a session.
+    
+    Requirements:
+    - 15.2: Use previous query results as context for follow-up questions
+    - 15.3: Allow users to reference previous results
+    
+    Args:
+        session_id: Session identifier
+        
+    Returns:
+        Query history for the session
+        
+    Raises:
+        HTTPException: If session not found or retrieval fails
+    """
+    # Check if session manager is initialized
+    if not session_manager:
+        logger.error("session_manager_not_initialized")
+        raise HTTPException(
+            status_code=503,
+            detail="Service not ready. Session manager not initialized."
+        )
+    
+    logger.info("session_history_requested", session_id=session_id)
+    
+    try:
+        history = session_manager.get_session_history(session_id)
+        
+        if history is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session not found: {session_id}"
+            )
+        
+        # Convert to dict for JSON response
+        history_dicts = [
+            {
+                "query_id": item.query_id,
+                "query": item.query,
+                "synthesized_answer": item.synthesized_answer,
+                "sources": item.sources,
+                "confidence_score": item.confidence_score,
+                "timestamp": item.timestamp,
+                "memory_id": item.memory_id
+            }
+            for item in history
+        ]
+        
+        logger.info(
+            "session_history_retrieved",
+            session_id=session_id,
+            query_count=len(history_dicts)
+        )
+        
+        return {
+            "session_id": session_id,
+            "query_count": len(history_dicts),
+            "history": history_dicts
+        }
+        
+    except HTTPException:
+        raise
+    
+    except SessionManagerError as e:
+        logger.error("session_history_retrieval_failed", error=str(e), session_id=session_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to retrieve session history: {str(e)}"
+        )
+
+
+@app.delete("/api/session/{session_id}")
+async def delete_session(session_id: str):
+    """
+    Delete a conversation session.
+    
+    Requirements: 15.6 - Session management
+    
+    Args:
+        session_id: Session identifier
+        
+    Returns:
+        Success message
+        
+    Raises:
+        HTTPException: If deletion fails
+    """
+    # Check if session manager is initialized
+    if not session_manager:
+        logger.error("session_manager_not_initialized")
+        raise HTTPException(
+            status_code=503,
+            detail="Service not ready. Session manager not initialized."
+        )
+    
+    logger.info("session_deletion_requested", session_id=session_id)
+    
+    try:
+        success = session_manager.delete_session(session_id)
+        
+        if not success:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session not found: {session_id}"
+            )
+        
+        logger.info("session_deleted_via_endpoint", session_id=session_id)
+        
+        return {"success": True, "message": "Session deleted successfully"}
+        
+    except HTTPException:
+        raise
+    
+    except SessionManagerError as e:
+        logger.error("session_deletion_failed", error=str(e), session_id=session_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete session: {str(e)}"
+        )
+
+
+# Logs Endpoint
+@app.get("/api/logs")
+async def get_logs(
+    start_time: Optional[float] = None,
+    end_time: Optional[float] = None,
+    level: Optional[str] = None,
+    request_id: Optional[str] = None,
+    event: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0
+):
+    """
+    Get application logs with filtering.
+    
+    Requirements:
+    - 14.5: Expose logs via /api/logs endpoint with filtering capabilities
+    - 14.2: Structured JSON logging with request IDs
+    
+    Args:
+        start_time: Start of time range (Unix timestamp)
+        end_time: End of time range (Unix timestamp)
+        level: Filter by log level (debug, info, warning, error, critical)
+        request_id: Filter by request ID
+        event: Filter by event name
+        limit: Maximum number of logs to return (default: 100)
+        offset: Number of logs to skip (default: 0)
+        
+    Returns:
+        Filtered log entries with pagination info
+        
+    Raises:
+        HTTPException: If log retrieval fails
+    """
+    # Check if log manager is initialized
+    if not log_manager:
+        logger.error("log_manager_not_initialized")
+        raise HTTPException(
+            status_code=503,
+            detail="Service not ready. Log manager not initialized."
+        )
+    
+    logger.info(
+        "logs_requested",
+        start_time=start_time,
+        end_time=end_time,
+        level=level,
+        request_id=request_id,
+        event=event,
+        limit=limit,
+        offset=offset
+    )
+    
+    try:
+        # Create query
+        query = LogQuery(
+            start_time=start_time,
+            end_time=end_time,
+            level=level,
+            request_id=request_id,
+            event=event,
+            limit=limit,
+            offset=offset
+        )
+        
+        # Query logs
+        logs = log_manager.query_logs(query)
+        
+        # Convert to dict for JSON response
+        log_dicts = []
+        for log in logs:
+            log_dict = {
+                "timestamp": log.timestamp,
+                "datetime": datetime.fromtimestamp(log.timestamp).isoformat(),
+                "level": log.level,
+                "message": log.message,
+                "request_id": log.request_id,
+                "event": log.event,
+                "context": log.context
+            }
+            log_dicts.append(log_dict)
+        
+        # Get stats
+        stats = log_manager.get_log_stats()
+        
+        logger.info(
+            "logs_retrieved",
+            count=len(log_dicts),
+            limit=limit,
+            offset=offset
+        )
+        
+        return {
+            "total": stats.get("memory_logs_count", 0),
+            "returned": len(log_dicts),
+            "limit": limit,
+            "offset": offset,
+            "filters": {
+                "start_time": start_time,
+                "end_time": end_time,
+                "level": level,
+                "request_id": request_id,
+                "event": event
+            },
+            "logs": log_dicts,
+            "stats": stats
+        }
+        
+    except Exception as e:
+        logger.error(
+            "logs_retrieval_error",
+            error=str(e),
+            error_type=type(e).__name__
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while retrieving logs."
         )
 
 
