@@ -47,13 +47,23 @@ class MCPToolRouter:
         
         for server_name, config in self.mcp_config.items():
             try:
-                await self._connect_server(server_name, config)
+                # Add overall timeout for each server connection
+                await asyncio.wait_for(
+                    self._connect_server(server_name, config),
+                    timeout=15.0
+                )
                 logger.info(f"Connected to {server_name} MCP server")
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout connecting to {server_name} MCP server (15s)")
+                # Continue with other servers even if one fails
             except Exception as e:
                 logger.error(f"Failed to connect to {server_name} MCP server", error=str(e))
                 # Continue with other servers even if one fails
         
         logger.info(f"MCP Tool Router initialized with {len(self.tool_registry)} tools")
+        
+        if len(self.tool_registry) == 0:
+            logger.warning("No MCP tools available - running in degraded mode")
     
     async def _connect_server(self, server_name: str, config: Dict[str, Any]):
         """Connect to a single MCP server"""
