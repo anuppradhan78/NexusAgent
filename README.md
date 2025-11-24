@@ -99,23 +99,75 @@ An autonomous, self-improving AI research system that gathers information from r
 
 ### Running the Agent
 
-1. **Start the FastAPI server**
+**Quick Start (Recommended):**
+
+Use the startup scripts to start all services automatically:
+
+```bash
+# On Windows
+startup.bat
+
+# On Linux/Mac
+chmod +x startup.sh shutdown.sh
+./startup.sh
+```
+
+This will:
+- Start Redis with Docker
+- Start the API server
+- Verify all services are running
+
+**Manual Start:**
+
+1. **Start Redis**
    ```bash
-   cd backend
-   uvicorn main:app --reload --port 8000
+   docker run -d -p 6379:6379 redis/redis-stack:latest
+   # Or on Windows: start_redis.bat
    ```
 
-2. **Check health endpoint**
+2. **Start the API server**
+   ```bash
+   cd backend
+   python main.py
+   ```
+
+3. **Check health endpoint**
    ```bash
    curl http://localhost:8000/health
    ```
 
-3. **Process a research query** (coming in Phase 2)
-   ```bash
-   curl -X POST http://localhost:8000/api/research/query \
-     -H "Content-Type: application/json" \
-     -d '{"query": "What are the latest AI trends?", "max_sources": 5}'
-   ```
+**Run the Demo:**
+
+```bash
+python demo.py
+```
+
+This will demonstrate all key features:
+- Autonomous query processing
+- Learning from feedback
+- Alert generation
+- Report creation
+- Self-improvement metrics
+- Scheduled queries
+- Multi-turn conversations
+
+**Process a Research Query:**
+
+```bash
+curl -X POST http://localhost:8000/api/research/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What are the latest AI trends?", "max_sources": 5}'
+```
+
+**Shutdown:**
+
+```bash
+# On Windows
+shutdown.bat
+
+# On Linux/Mac
+./shutdown.sh
+```
 
 ## 🧪 Testing
 
@@ -148,23 +200,23 @@ pytest test_memory_store.py -v
 - [x] Parallel information gathering
 - [x] Result synthesis with citations
 
-### 🚧 Phase 3: Learning & Improvement (In Progress)
-- [ ] Learning engine for query refinement
-- [ ] Feedback system for relevance scoring
-- [ ] Confidence threshold adaptation
-- [ ] Source prioritization based on performance
+### ✅ Phase 3: Learning & Improvement (Complete)
+- [x] Learning engine for query refinement
+- [x] Feedback system for relevance scoring
+- [x] Confidence threshold adaptation
+- [x] Source prioritization based on performance
 
-### 📅 Phase 4: Actions & Observability
-- [ ] Alert engine for critical information
-- [ ] Report generator for markdown reports
-- [ ] Metrics endpoint for self-improvement tracking
-- [ ] History and reports API endpoints
+### ✅ Phase 4: Actions & Observability (Complete)
+- [x] Alert engine for critical information
+- [x] Report generator for markdown reports
+- [x] Metrics endpoint for self-improvement tracking
+- [x] History and reports API endpoints
 
-### 📅 Phase 5: Advanced Features
-- [ ] Scheduled recurring queries
-- [ ] Multi-turn conversation support
-- [ ] Comprehensive logging and tracing
-- [ ] Demo script and documentation
+### ✅ Phase 5: Advanced Features (Complete)
+- [x] Scheduled recurring queries
+- [x] Multi-turn conversation support
+- [x] Comprehensive logging and tracing
+- [x] Demo script and documentation
 
 ## 🏛️ Architecture Principles
 
@@ -194,18 +246,20 @@ GET /health
 ```
 Returns service status and configuration validation.
 
-### Research Query (Phase 2+)
+### Research Query
 ```
 POST /api/research/query
 {
   "query": "What are the latest AI trends?",
   "session_id": "optional-uuid",
   "max_sources": 5,
-  "include_report": true
+  "include_report": true,
+  "alert_enabled": true
 }
 ```
+Returns synthesized answer with sources, confidence score, and optional report.
 
-### Feedback Submission (Phase 3+)
+### Feedback Submission
 ```
 POST /api/research/feedback
 {
@@ -214,12 +268,50 @@ POST /api/research/feedback
   "feedback_notes": "Very helpful"
 }
 ```
+Submit feedback to improve future queries through learning.
 
-### Metrics (Phase 4+)
+### Query History
+```
+GET /api/research/history?limit=50&offset=0&min_relevance=0.0
+```
+Retrieve past queries with pagination and filtering.
+
+### Metrics
 ```
 GET /api/metrics
 ```
-Returns self-improvement metrics and learning statistics.
+Returns self-improvement metrics, learning statistics, and performance trends.
+
+### Reports
+```
+GET /api/reports
+GET /api/reports/{report_id}
+```
+List and retrieve generated research reports.
+
+### Scheduled Queries
+```
+POST /api/schedule
+GET /api/schedule
+GET /api/schedule/{schedule_id}
+PUT /api/schedule/{schedule_id}
+DELETE /api/schedule/{schedule_id}
+```
+Create and manage recurring scheduled queries.
+
+### Sessions (Multi-Turn Conversations)
+```
+POST /api/session
+GET /api/session/{session_id}/history
+DELETE /api/session/{session_id}
+```
+Manage conversation sessions for context-aware interactions.
+
+### Logs
+```
+GET /api/logs?level=INFO&limit=100&request_id=xxx
+```
+Query structured application logs with filtering.
 
 ## 🔧 Configuration
 
@@ -262,6 +354,222 @@ MCP servers are configured in `mcp.json`:
 ```
 
 
+## 💡 Usage Examples
+
+### Quick Start Demo
+
+Run the comprehensive demo to see all features in action:
+
+```bash
+python demo.py
+```
+
+This demonstrates:
+1. **Autonomous Query Processing** - Submit natural language queries
+2. **Learning from Feedback** - Provide relevance scores to improve results
+3. **Alert Generation** - Automatic detection of critical information
+4. **Report Generation** - Comprehensive markdown reports with citations
+5. **Self-Improvement Metrics** - Track performance improvements over time
+6. **Scheduled Queries** - Set up recurring research tasks
+7. **Multi-Turn Conversations** - Context-aware follow-up questions
+
+### Python Client Example
+
+```python
+import httpx
+import asyncio
+
+async def research_query():
+    async with httpx.AsyncClient() as client:
+        # Submit a research query
+        response = await client.post(
+            "http://localhost:8000/api/research/query",
+            json={
+                "query": "What are the latest developments in quantum computing?",
+                "max_sources": 5,
+                "include_report": True
+            }
+        )
+        
+        result = response.json()
+        print(f"Answer: {result['synthesized_answer']}")
+        print(f"Confidence: {result['confidence_score']}")
+        print(f"Sources: {len(result['sources'])}")
+        
+        # Provide feedback
+        await client.post(
+            "http://localhost:8000/api/research/feedback",
+            json={
+                "query_id": result['query_id'],
+                "relevance_score": 0.9
+            }
+        )
+
+asyncio.run(research_query())
+```
+
+### Command Line Examples
+
+```bash
+# Submit a research query
+curl -X POST http://localhost:8000/api/research/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "What are the latest AI breakthroughs?",
+    "max_sources": 3,
+    "include_report": true
+  }'
+
+# Provide feedback
+curl -X POST http://localhost:8000/api/research/feedback \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query_id": "your-query-id",
+    "relevance_score": 0.85
+  }'
+
+# Get metrics
+curl http://localhost:8000/api/metrics
+
+# View query history
+curl "http://localhost:8000/api/research/history?limit=10"
+
+# Create scheduled query
+curl -X POST http://localhost:8000/api/schedule \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "Daily tech news summary",
+    "schedule": "0 9 * * *",
+    "max_sources": 5
+  }'
+```
+
+### Example Scripts
+
+The `examples/` directory contains detailed usage examples:
+
+- `example_alert_usage.py` - Alert generation and notification
+- `example_history_reports_usage.py` - Query history and reports
+- `example_logging_usage.py` - Logging and observability
+- `example_metrics_usage.py` - Metrics and self-improvement
+- `example_report_usage.py` - Report generation
+- `example_scheduler_usage.py` - Scheduled queries
+- `example_session_usage.py` - Multi-turn conversations
+
+Run any example:
+```bash
+python examples/example_metrics_usage.py
+```
+
+## 🔍 How It Works
+
+### 1. Query Processing Pipeline
+
+```
+User Query → Intent Parsing (Claude) → Memory Search (Redis) 
+→ Query Refinement (Learning Engine) → API Discovery (Postman)
+→ Parallel API Calls → Information Synthesis (Claude)
+→ Alert Evaluation → Report Generation → Memory Storage
+```
+
+### 2. Learning Loop
+
+```
+Query Results → User Feedback → Relevance Score Update
+→ Pattern Analysis → Confidence Threshold Adjustment
+→ Source Prioritization → Query Refinement Rules
+→ Improved Future Queries
+```
+
+### 3. Self-Improvement Metrics
+
+The agent tracks:
+- **Average Relevance Score**: How useful results are to users
+- **Confidence Score**: Agent's certainty in its answers
+- **Improvement Trend**: Performance change over time
+- **Source Performance**: Which APIs provide best results
+- **Query Efficiency**: Processing time and resource usage
+
+## 🧪 Testing
+
+### Run All Tests
+```bash
+cd backend
+pytest -v
+```
+
+### Run Specific Test Categories
+```bash
+# Unit tests
+pytest tests/test_agent_orchestrator.py -v
+pytest tests/test_learning_engine.py -v
+pytest tests/test_memory_store.py -v
+
+# Integration tests
+pytest tests/test_learning_integration.py -v
+pytest tests/test_e2e_query_flow.py -v
+
+# End-to-end tests
+pytest tests/test_task18_alerts_reports_integration.py -v
+```
+
+### Test Coverage
+```bash
+pytest --cov=backend --cov-report=html
+```
+
+## 🐛 Troubleshooting
+
+### Redis Connection Issues
+```
+Error: Could not connect to Redis
+```
+**Solution**: Ensure Redis is running with RediSearch module:
+```bash
+docker run -d -p 6379:6379 redis/redis-stack:latest
+```
+
+### MCP Connection Issues
+```
+Error: MCP server connection failed
+```
+**Solution**: 
+1. Check that Node.js is installed
+2. Verify API keys in `.env` file
+3. Check `mcp.json` configuration
+4. Try running: `npx -y @anthropic-ai/mcp-server-anthropic`
+
+### API Server Not Starting
+```
+Error: Address already in use
+```
+**Solution**: Kill existing process on port 8000:
+```bash
+# Linux/Mac
+lsof -ti:8000 | xargs kill -9
+
+# Windows
+netstat -ano | findstr :8000
+taskkill /PID <PID> /F
+```
+
+### Missing Dependencies
+```
+ModuleNotFoundError: No module named 'xxx'
+```
+**Solution**: Reinstall dependencies:
+```bash
+pip install -r backend/requirements.txt
+```
+
+## 📚 Documentation
+
+- [Requirements Document](.kiro/specs/adaptive-research-agent/requirements.md) - Detailed requirements
+- [Design Document](.kiro/specs/adaptive-research-agent/design.md) - System architecture
+- [Implementation Tasks](.kiro/specs/adaptive-research-agent/tasks.md) - Development roadmap
+- [Examples README](examples/README.md) - Usage examples
+- [Project Organization](docs/PROJECT_ORGANIZATION.md) - Code structure
+
 ## 🙏 Acknowledgments
 
 - Built for the Context Engineering Challenge
@@ -278,6 +586,6 @@ AImitari Medtech Pte. Ltd.
 
 ---
 
-**Status**: Phase 2 Complete - Agent Orchestrator Implemented ✅
+**Status**: All Phases Complete - Fully Functional Autonomous Research Agent ✅
 
 
