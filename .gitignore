@@ -37,18 +37,16 @@ env/
 *.swo
 *~
 
-# Kiro specs (project-specific)
-.kiro/specs/
+# Node.js (for MCP servers)
+node_modules/
+package-lock.json
+*.tsbuildinfo
+mcp-servers/*/dist/
+mcp-servers/*/build/
 
-# Example projects
-example projects/
-
-# Reports (exclude generated reports but keep documentation)
+# Reports (generated reports)
 reports/*.md
-!README.md
-!**/requirements.md
-!**/design.md
-!**/tasks.md
+backend/reports/*.md
 
 # Logs
 *.log
