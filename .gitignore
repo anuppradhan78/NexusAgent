@@ -37,6 +37,9 @@ env/
 *.swo
 *~
 
+# Kiro specs (development artifacts)
+.kiro/specs/
+
 # Node.js (for MCP servers)
 node_modules/
 package-lock.json
