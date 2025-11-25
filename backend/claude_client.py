@@ -19,7 +19,7 @@ class ClaudeClient:
             raise ValueError("ANTHROPIC_API_KEY is required")
         
         self.client = Anthropic(api_key=self.api_key)
-        self.model = "claude-3-5-sonnet-20241022"
+        self.model = "claude-3-haiku-20240307"  # Claude 3 Haiku (available on your account)
         self.max_retries = 3
     
     async def call_with_tools(

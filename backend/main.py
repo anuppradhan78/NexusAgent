@@ -241,7 +241,7 @@ async def health_check():
         except:
             pass
     
-    mcp_servers_connected = len(mcp_tool_router.sessions) if mcp_tool_router else 0
+    mcp_servers_connected = len(mcp_tool_router.tool_registry) if mcp_tool_router else 0
     
     status = "healthy" if redis_connected and mcp_servers_connected > 0 else "degraded"
     
